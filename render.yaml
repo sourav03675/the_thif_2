@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: tor-playwright-api
+    runtime: docker
+    plan: free
+    buildCommand: ""
+    startCommand: ""

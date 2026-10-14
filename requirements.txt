@@ -1,0 +1,4 @@
+quart
+quart-cors
+playwright==1.43.0
+beautifulsoup4
