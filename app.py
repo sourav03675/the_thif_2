@@ -57,6 +57,7 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+BUILD = "r6-2026-10-14"
 PROXY = os.environ.get("PROXY", "none").strip()
 USE_PROXY = bool(PROXY) and PROXY.lower() != "none"
 HTTP_FIRST = os.environ.get("HTTP_FIRST", "1") != "0"
@@ -273,7 +274,7 @@ def find_redirect(soup: BeautifulSoup, strict: bool = False):
     return None
 
 
-def pick_link(html: str, selector: str):
+def pick_link(html: str, selector: str, base_url: str | None = None):
     """Returns (href, source) where source explains how it was found."""
     soup = BeautifulSoup(html, "html.parser")
     try:
@@ -282,15 +283,15 @@ def pick_link(html: str, selector: str):
         el = None
     if el is not None and el.get("href"):
         return el["href"], "selector"
-    # Fallback: first anchor that is a real link and not just the site root / logo.
+    # Fallback: first absolute link that leaves the site (download hosts are separate
+    # domains, e.g. *.workers.dev). Never return site navigation like /about-us.
+    page_host = urllib.parse.urlparse(base_url).hostname if base_url else None
     for a in soup.find_all("a", href=True):
         h = a["href"].strip()
-        if not h or h.startswith(("#", "javascript:", "mailto:")):
-            continue
         pu = urllib.parse.urlparse(h)
-        if pu.scheme not in ("http", "https"):
-            continue  # relative links like /login are site navigation, not downloads
-        if pu.path in ("", "/") or pu.path.lower().startswith(("/login", "/register", "/signup")):
+        if pu.scheme not in ("http", "https") or not pu.hostname:
+            continue
+        if page_host and (pu.hostname == page_host or pu.hostname.endswith("." + page_host)):
             continue
         return h, "fallback_anchor"
     return None, "no_anchor"
@@ -457,7 +458,7 @@ async def http_variant(session, key, url, selector, trace):
     if is_challenge(r.status_code, text):
         trace.add(f"variant:{key}", via="http", ok=False, url=url, status=r.status_code, reason="challenge")
         return key, None
-    href, source = pick_link(text, selector)
+    href, source = pick_link(text, selector, url)
     trace.add(
         f"variant:{key}", via="http", ok=bool(href), url=url, status=r.status_code,
         source=source, ms=int((time.perf_counter() - t) * 1000),
@@ -648,29 +649,24 @@ async def browser_hops(start_url, trace, fast=False):
             # The page may be an intermediate (e.g. /r?key=...&id=...) that redirects
             # again via JS / timer. Wait for a real /file/<id> URL, following any
             # extra redirect we can find on the page.
-            for i in range(MAX_EXTRA_HOPS + 1):
-                if is_file_url(page.url):
-                    break
-                try:
-                    await page.wait_for_url(lambda u: is_file_url(u), timeout=FILE_URL_WAIT * 1000 if i == 0 else 4000)
-                    break
-                except Exception:
-                    pass
-                if i == MAX_EXTRA_HOPS:
-                    break
+            hops_left = MAX_EXTRA_HOPS
+            deadline = time.monotonic() + FILE_URL_WAIT
+            while not is_file_url(page.url) and time.monotonic() < deadline:
                 try:
                     cand = await page.evaluate(EXTRACT_JS_STRICT)
                 except Exception:
-                    cand = None
-                if not cand:
-                    break
-                nxt = clean_url(cand[0], page.url)
-                trace.add("browser:extra_hop", n=i + 1, rule=cand[1], url=nxt)
-                try:
-                    await page.goto(nxt, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-                except Exception as e:
-                    trace.add("browser:extra_hop", ok=False, error=err_text(e))
-                    break
+                    cand = None  # mid-navigation
+                if cand and hops_left > 0:
+                    nxt = clean_url(cand[0], page.url)
+                    if nxt != page.url:
+                        hops_left -= 1
+                        trace.add("browser:extra_hop", rule=cand[1], url=nxt)
+                        try:
+                            await page.goto(nxt, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                        except Exception as e:
+                            trace.add("browser:extra_hop", ok=False, error=err_text(e))
+                        continue
+                await asyncio.sleep(0.2)
 
             final_url = page.url
             trace.add("browser:final", url=final_url, is_file_url=is_file_url(final_url))
@@ -707,7 +703,7 @@ async def browser_variant(key, url, selector, trace):
                 source, html = "selector", ""
                 if not href:
                     html = await pg.content()
-                    href, source = pick_link(html, selector)
+                    href, source = pick_link(html, selector, url)
                 reason = None
                 if not href:
                     reason = "challenge" if is_challenge(None, html) else "no_anchor"
@@ -732,6 +728,7 @@ async def scrape(start_url: str, mode: str, trace: Trace, fast: bool = False) ->
     if mode == "http" and not HAVE_CURL:
         raise ScrapeError("HTTP_UNAVAILABLE", "curl_cffi is not installed", 500)
 
+    trace.add("build", build=BUILD, fast=fast, mode=mode, http_available=HAVE_CURL)
     host = urllib.parse.urlparse(start_url).hostname or ""
     bad = mode == "auto" and time.time() - _http_bad.get(host, 0) < HTTP_BAD_TTL
     use_http = HAVE_CURL and HTTP_FIRST and mode in ("auto", "http") and not bad
@@ -908,6 +905,8 @@ async def shutdown():
 async def health():
     return jsonify({
         "ok": True,
+        "build": BUILD,
+        "http_bad_hosts": sorted(_http_bad),
         "http_available": HAVE_CURL,
         "http_first": HTTP_FIRST,
         "browser_running": bool(_browser and _browser.is_connected()),
