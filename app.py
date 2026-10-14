@@ -62,16 +62,19 @@ HTTP_FIRST = os.environ.get("HTTP_FIRST", "1") != "0"
 VARIANT_BASE = os.environ.get("VARIANT_BASE", "https://driveseed.org").rstrip("/")
 ALLOWED_HOSTS = [h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()]
 
-HTTP_TIMEOUT = _env_float("HTTP_TIMEOUT", 10)            # seconds per HTTP request
+HTTP_TIMEOUT = _env_float("HTTP_TIMEOUT", 6)            # seconds per HTTP request
 NAV_TIMEOUT_MS = int(_env_float("NAV_TIMEOUT", 15) * 1000)  # browser navigation
 LANDING_WAIT_MS = int(_env_float("LANDING_WAIT", 2) * 1000)  # wait for #landing form
 REDIRECT_WAIT = _env_float("REDIRECT_WAIT", 10)          # browser: wait for redirect URL
-SETTLE = _env_float("SETTLE", 0.5)                       # browser: wait for JS redirects
+SETTLE = _env_float("SETTLE", 0.1)                       # browser: wait for JS redirects
 TOTAL_TIMEOUT = _env_float("TOTAL_TIMEOUT", 45)          # whole request
 CACHE_TTL = _env_float("CACHE_TTL", 300)                 # seconds, 0 disables
 CACHE_MAX = 256
 MAX_BROWSER_PAGES = int(_env_float("MAX_BROWSER_PAGES", 4))
-PRELAUNCH = os.environ.get("PRELAUNCH_BROWSER", "0") == "1"
+PRELAUNCH = os.environ.get("PRELAUNCH_BROWSER", "1") == "1"
+VARIANT_TIMEOUT = _env_float("VARIANT_TIMEOUT", 4)        # HTTP variant fetch timeout
+VARIANT_DEADLINE = _env_float("VARIANT_DEADLINE", 5)      # max time to wait for slow variants
+BROWSER_VARIANT_RETRY = os.environ.get("BROWSER_VARIANT_RETRY", "0") == "1"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -176,6 +179,9 @@ _SCRIPT_RULES = (
     ("script:window.location", _RE_LOCATION),
     ("script:location.assign", _RE_ASSIGN),
 )
+_RE_FILE_IN_TEXT = re.compile(
+    r"""["'`]((?:https?:)?//[^"'`\s]+/(?:file|zfile|wfile)/[A-Za-z0-9_-]+/?|/(?:file|zfile|wfile)/[A-Za-z0-9_-]+/?)["'`]"""
+)
 _ANCHOR_HINTS = ("driveseed.org", "/zfile/", "/wfile/", "/file/")
 
 _CHALLENGE_MARKERS = (
@@ -223,6 +229,11 @@ def find_redirect(soup: BeautifulSoup, strict: bool = False):
     el = soup.find(id="c")
     if el is not None and el.get("href"):
         return el["href"], "element#c"
+    if strict:  # timer/countdown pages usually carry the target URL in a script
+        for s in soup.find_all("script"):
+            m = _RE_FILE_IN_TEXT.search(s.string or s.get_text() or "")
+            if m:
+                return m.group(1), "script:file_url"
     hints = _ANCHOR_HINTS[1:] if strict else _ANCHOR_HINTS
     for a in soup.find_all("a", href=True):
         if any(h in a["href"] for h in hints):
@@ -244,8 +255,10 @@ def pick_link(html: str, selector: str):
         h = a["href"].strip()
         if not h or h.startswith(("#", "javascript:", "mailto:")):
             continue
-        path = urllib.parse.urlparse(h).path
-        if path in ("", "/"):
+        pu = urllib.parse.urlparse(h)
+        if pu.scheme not in ("http", "https"):
+            continue  # relative links like /login are site navigation, not downloads
+        if pu.path in ("", "/") or pu.path.lower().startswith(("/login", "/register", "/signup")):
             continue
         return h, "fallback_anchor"
     return None, "no_anchor"
@@ -362,7 +375,7 @@ async def http_hops(session, start_url, trace):
 async def http_variant(session, key, url, selector, trace):
     t = time.perf_counter()
     try:
-        r = await session.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        r = await session.get(url, timeout=VARIANT_TIMEOUT, allow_redirects=True)
     except Exception as e:
         trace.add(f"variant:{key}", via="http", ok=False, url=url, reason="request_failed", error=err_text(e))
         return key, None
@@ -649,12 +662,25 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
             for key, (path, sel) in VARIANTS.items()
         }
 
+        async def run_bounded(coros):
+            """Run variant fetches in parallel; stop waiting after VARIANT_DEADLINE."""
+            tasks = {asyncio.ensure_future(c): k for k, c in coros.items()}
+            done, pending = await asyncio.wait(tasks, timeout=VARIANT_DEADLINE)
+            for t in pending:
+                t.cancel()
+                trace.add(f"variant:{tasks[t]}", ok=False, reason="deadline")
+            out = {k: None for k in coros}
+            for t in done:
+                if not t.cancelled() and t.exception() is None:
+                    k, v = t.result()
+                    out[k] = v
+            return out
+
         if method == "http":
-            results = dict(await asyncio.gather(
-                *[http_variant(session, k, u, s, trace) for k, (u, s) in variants.items()]
-            ))
+            results = await run_bounded({k: http_variant(session, k, u, s, trace) for k, (u, s) in variants.items()})
             missing = [k for k, v in results.items() if not v]
-            if missing and mode == "auto":
+            # Browser retry only when nothing at all came back (it costs 15s+).
+            if mode == "auto" and missing and (BROWSER_VARIANT_RETRY or len(missing) == len(results)):
                 trace.add("variants:browser_retry", keys=missing)
                 retried = await asyncio.gather(*[browser_variant(k, *variants[k], trace) for k in missing])
                 recovered = False
@@ -664,9 +690,7 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
                 if recovered:
                     method = "http+browser"
         else:
-            results = dict(await asyncio.gather(
-                *[browser_variant(k, u, s, trace) for k, (u, s) in variants.items()]
-            ))
+            results = await run_bounded({k: browser_variant(k, u, s, trace) for k, (u, s) in variants.items()})
 
         return {
             "final_url": final_url,
