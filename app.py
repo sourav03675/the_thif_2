@@ -120,6 +120,8 @@ _context = None
 _browser_lock: asyncio.Lock | None = None
 _page_sem: asyncio.Semaphore | None = None
 _cache: dict[str, tuple[float, dict]] = {}
+_http_bad: dict[str, float] = {}   # host -> time HTTP hops last failed there
+HTTP_BAD_TTL = _env_float("HTTP_BAD_TTL", 900)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,7 +270,23 @@ def page_title(soup: BeautifulSoup) -> str | None:
     return soup.title.get_text(strip=True)[:120] if soup.title else None
 
 
-def build_form_request(form, base_url: str):
+def js_field_value(scripts: str, name: str):
+    """Find a value a page script assigns to a form field (JS-populated tokens)."""
+    n = re.escape(name)
+    pats = (
+        rf"""getElementsByName\(\s*["']{n}["']\s*\)\s*\[\s*0\s*\]\s*\.value\s*=\s*["']([^"']+)["']""",
+        rf"""name=["']?{n}["']?\]?["')\s\]]*\)?\s*\.(?:val\(|value\s*=)\s*["']([^"']+)["']""",
+        rf"""["']{n}["']\s*[,:]\s*["']([^"']{{6,}})["']""",
+        rf"""\.name\s*=\s*["']{n}["'][^;]*;[^;]*\.value\s*=\s*["']([^"']+)["']""",
+    )
+    for p in pats:
+        m = re.search(p, scripts)
+        if m:
+            return m.group(1)
+    return None
+
+
+def build_form_request(form, base_url: str, scripts: str = ""):
     """Rebuild what form.submit() would send (submit buttons are not included)."""
     url = urllib.parse.urljoin(base_url, form.get("action") or base_url)
     method = (form.get("method") or "get").lower()
@@ -290,6 +308,8 @@ def build_form_request(form, base_url: str):
         if itype in ("checkbox", "radio") and not el.has_attr("checked"):
             continue
         data[name] = el.get("value", "")
+        if not data[name] and scripts:
+            data[name] = js_field_value(scripts, name) or ""
     return method, url, data
 
 
@@ -324,8 +344,14 @@ async def http_hops(session, start_url, trace):
 
     form = soup.find("form", id="landing")
     if form is not None:
-        method, action, data = build_form_request(form, str(r.url))
-        trace.add("http:landing_form", method=method, action=action, fields=sorted(data))
+        scripts = "\n".join((sc.string or sc.get_text() or "") for sc in soup.find_all("script"))
+        method, action, data = build_form_request(form, str(r.url), scripts)
+        trace.add(
+            "http:landing_form", method=method, action=action,
+            fields={k: (v[:30] + ("..." if len(v) > 30 else "")) for k, v in data.items()},
+            form_html=snippet(str(form), 500), scripts=snippet(scripts, 900),
+            cookies=sorted(session.cookies.keys()) if hasattr(session, "cookies") else None,
+        )
         kw = {"headers": {"Referer": str(r.url)}}
         kw["data" if method == "post" else "params"] = data
         r, html = await http_request(
@@ -628,7 +654,11 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
     if mode == "http" and not HAVE_CURL:
         raise ScrapeError("HTTP_UNAVAILABLE", "curl_cffi is not installed", 500)
 
-    use_http = HAVE_CURL and HTTP_FIRST and mode in ("auto", "http")
+    host = urllib.parse.urlparse(start_url).hostname or ""
+    bad = mode == "auto" and time.time() - _http_bad.get(host, 0) < HTTP_BAD_TTL
+    use_http = HAVE_CURL and HTTP_FIRST and mode in ("auto", "http") and not bad
+    if bad:
+        trace.add("http:skipped", reason="HTTP hops failed recently for this host", host=host)
     session = None
     try:
         hops, method = None, None
@@ -639,6 +669,8 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
                 hops, method = await http_hops(session, start_url, trace), "http"
             except ScrapeError as e:
                 trace.add("http:failed", code=e.code, message=e.message, **e.info)
+                if e.code in ("REDIRECT_NOT_FOUND", "BLOCKED_BY_CHALLENGE", "NO_FILE_ID"):
+                    _http_bad[host] = time.time()
                 if mode == "http":
                     raise
             except Exception as e:
@@ -646,7 +678,10 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
                 if mode == "http":
                     raise ScrapeError("INTERNAL", f"HTTP path crashed: {err_text(e)}", 500)
             if hops is None:
-                trace.add("fallback", to="browser", reason="http path failed")
+                trace.add(
+                    "fallback", to="browser", reason="http path failed",
+                    warning="start link may be single-use and already consumed; retry with a fresh link if the browser finds no form",
+                )
 
         if hops is None:
             hops, method = await browser_hops(start_url, trace), "browser"
@@ -676,7 +711,13 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
                     out[k] = v
             return out
 
-        if method == "http":
+        if session is None and HAVE_CURL and mode == "auto":
+            kw = {"proxies": {"http": PROXY, "https": PROXY}} if USE_PROXY else {}
+            session = AsyncSession(impersonate="chrome", **kw)
+            method_for_variants = "browser"
+        else:
+            method_for_variants = method
+        if session is not None and mode != "browser":
             results = await run_bounded({k: http_variant(session, k, u, s, trace) for k, (u, s) in variants.items()})
             missing = [k for k, v in results.items() if not v]
             # Browser retry only when nothing at all came back (it costs 15s+).
@@ -688,7 +729,7 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
                     if v:
                         results[k], recovered = v, True
                 if recovered:
-                    method = "http+browser"
+                    method = method_for_variants + "+browser"
         else:
             results = await run_bounded({k: browser_variant(k, u, s, trace) for k, (u, s) in variants.items()})
 
