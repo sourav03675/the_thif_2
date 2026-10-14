@@ -75,7 +75,7 @@ MAX_BROWSER_PAGES = int(_env_float("MAX_BROWSER_PAGES", 4))
 PRELAUNCH = os.environ.get("PRELAUNCH_BROWSER", "1") == "1"
 VARIANT_TIMEOUT = _env_float("VARIANT_TIMEOUT", 4)        # HTTP variant fetch timeout
 VARIANT_DEADLINE = _env_float("VARIANT_DEADLINE", 5)      # max time to wait for slow variants
-FAST_TIMERS = os.environ.get("FAST_TIMERS", "0") == "1"   # shrink JS countdowns in the browser
+FAST_TIMERS = os.environ.get("FAST_TIMERS", "1") == "1"   # shrink JS countdowns in the browser
 BROWSER_VARIANT_RETRY = os.environ.get("BROWSER_VARIANT_RETRY", "0") == "1"
 
 UA = (
@@ -176,7 +176,7 @@ def err_text(e: BaseException) -> str:
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
-_RE_SETATTR = re.compile(r'c\.setAttribute\("href","([^"]+)"\)')
+_RE_SETATTR = re.compile(r"""\.setAttribute\(\s*["']href["']\s*,\s*["']([^"']+)["']\s*\)""")
 _RE_LOCATION = re.compile(r'window\.location(?:\.href)?\s*=\s*"([^"]+)"')
 _RE_ASSIGN = re.compile(r"""location\.assign\(["']([^"']+)["']\)""")
 _SCRIPT_RULES = (
@@ -187,6 +187,33 @@ _SCRIPT_RULES = (
 _RE_FILE_IN_TEXT = re.compile(
     r"""["'`]((?:https?:)?//[^"'`\s]+/(?:file|zfile|wfile)/[A-Za-z0-9_-]+/?|/(?:file|zfile|wfile)/[A-Za-z0-9_-]+/?)["'`]"""
 )
+_RE_META_REFRESH = re.compile(r"""<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*?url=\s*([^"'>\s]+)""", re.I)
+_RE_NAV = re.compile(
+    r"""(?:(?:window|document|top|self)\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']"""
+    r"""|location\.(?:replace|assign)\(\s*["']([^"']+)["']\s*\)"""
+)
+
+
+def find_navigation(html: str, base: str):
+    """Candidate next URLs from meta-refresh / location.* assignments (same host only)."""
+    host = urllib.parse.urlparse(base).hostname
+    out = []
+    for m in _RE_META_REFRESH.finditer(html):
+        out.append((m.group(1), "meta:refresh"))
+    for m in _RE_NAV.finditer(html):
+        out.append((m.group(1) or m.group(2), "script:location"))
+    res = []
+    for raw, rule in out:
+        u = clean_url(raw, base)
+        pu = urllib.parse.urlparse(u)
+        if pu.scheme not in ("http", "https") or u.split("#")[0] == base.split("#")[0]:
+            continue
+        if pu.hostname != host and "driveseed" not in (pu.hostname or ""):
+            continue
+        res.append((u, rule))
+    return res
+
+
 _ANCHOR_HINTS = ("driveseed.org", "/zfile/", "/wfile/", "/file/")
 
 _CHALLENGE_MARKERS = (
@@ -366,10 +393,28 @@ async def http_hops(session, start_url, trace):
         trace.add("http:landing_form", present=False)
 
     found = find_redirect(soup)
+    nav_hops = 0
+    while not found and nav_hops < 3:
+        cands = find_navigation(html, str(r.url))
+        trace.add("http:nav_candidates", page=str(r.url), cands=[c[0][:120] for c in cands][:5])
+        if not cands:
+            break
+        nxt, rule = cands[0]
+        trace.add("http:nav_hop", rule=rule, url=nxt)
+        r, html = await http_request(
+            session, "GET", nxt, f"http:nav_hop{nav_hops + 1}", trace, "START_URL_FAILED",
+            headers={"Referer": str(r.url)},
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        found = find_redirect(soup)
+        nav_hops += 1
     if not found:
+        scripts_txt = "\n".join((sc.string or sc.get_text() or "") for sc in soup.find_all("script"))
         raise ScrapeError(
             "REDIRECT_NOT_FOUND", "Redirect URL not found in HTML (maybe built by JavaScript)", 504,
-            via="http", page_url=str(r.url), title=page_title(soup), snippet=snippet(html),
+            via="http", page_url=str(r.url), title=page_title(soup),
+            snippet=snippet(html), scripts=snippet(scripts_txt, 1500),
+            nav=[c[0][:120] for c in find_navigation(html, str(r.url))][:5],
         )
     raw, source = found
     redirect_url = clean_url(raw, str(r.url))
@@ -717,7 +762,13 @@ async def scrape(start_url: str, mode: str, trace: Trace, fast: bool = False) ->
                 )
 
         if hops is None:
-            hops, method = await browser_hops(start_url, trace, fast), "browser"
+            try:
+                hops, method = await browser_hops(start_url, trace, fast), "browser"
+            except ScrapeError as e:
+                if not fast:
+                    raise
+                trace.add("browser:fast_failed_retrying_normal", code=e.code, message=e.message)
+                hops, method = await browser_hops(start_url, trace, False), "browser"
 
         redirect_url, final_url = hops
         file_id = file_id_from(final_url)
