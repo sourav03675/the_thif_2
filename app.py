@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -74,6 +75,7 @@ MAX_BROWSER_PAGES = int(_env_float("MAX_BROWSER_PAGES", 4))
 PRELAUNCH = os.environ.get("PRELAUNCH_BROWSER", "1") == "1"
 VARIANT_TIMEOUT = _env_float("VARIANT_TIMEOUT", 4)        # HTTP variant fetch timeout
 VARIANT_DEADLINE = _env_float("VARIANT_DEADLINE", 5)      # max time to wait for slow variants
+FAST_TIMERS = os.environ.get("FAST_TIMERS", "0") == "1"   # shrink JS countdowns in the browser
 BROWSER_VARIANT_RETRY = os.environ.get("BROWSER_VARIANT_RETRY", "0") == "1"
 
 UA = (
@@ -130,7 +132,8 @@ HTTP_BAD_TTL = _env_float("HTTP_BAD_TTL", 900)
 class Trace:
     """Collects timed steps so a failed request can be explained."""
 
-    def __init__(self, want_screenshot: bool = False):
+    def __init__(self, want_screenshot: bool = False, inspect: bool = False):
+        self.inspect = inspect
         self.t0 = time.perf_counter()
         self.steps: list[dict] = []
         self.want_screenshot = want_screenshot
@@ -444,6 +447,20 @@ EXTRACT_JS_STRICT = EXTRACT_JS.replace('h.includes("driveseed.org") || ', "")
 
 FILE_URL_WAIT = _env_float("FILE_URL_WAIT", 12)  # browser: wait for /file/<id> URL
 
+TIMER_JS = r"""(() => {
+  const FAST = __FAST__;
+  const log = (kind, d, fn) => { try { console.debug("__TIMER__" + JSON.stringify({kind, d, fn: String(fn).slice(0, 160)})); } catch (e) {} };
+  const oT = window.setTimeout.bind(window), oI = window.setInterval.bind(window);
+  window.setTimeout = function (fn, d, ...a) {
+    if (d > 400) { log("timeout", d, fn); if (FAST) d = 20; }
+    return oT(fn, d, ...a);
+  };
+  window.setInterval = function (fn, d, ...a) {
+    if (d > 400) { log("interval", d, fn); if (FAST) d = 20; }
+    return oI(fn, d, ...a);
+  };
+})();"""
+
 SUBMIT_JS = "()=>{const f=document.getElementById('landing');if(f&&f.submit)f.submit();}"
 
 
@@ -509,11 +526,22 @@ async def poll_redirect(page, max_wait: float):
         await asyncio.sleep(0.25)
 
 
-async def browser_hops(start_url, trace):
+async def browser_hops(start_url, trace, fast=False):
     ctx = await get_context(trace)
     async with _page_sem:
         page = await ctx.new_page()
         try:
+            await page.add_init_script(TIMER_JS.replace("__FAST__", "true" if fast else "false"))
+            if trace.inspect:
+                def on_console(m):
+                    if m.text.startswith("__TIMER__"):
+                        trace.add("inspect:timer", **json.loads(m.text[9:]))
+                page.on("console", on_console)
+                page.on("request", lambda r: r.resource_type in ("document", "xhr", "fetch", "other")
+                        and trace.add("inspect:request", method=r.method, type=r.resource_type,
+                                      url=r.url[:160], post=(r.post_data or "")[:200] or None))
+                page.on("response", lambda r: r.request.resource_type == "document"
+                        and trace.add("inspect:response", status=r.status, url=r.url[:160]))
             t = time.perf_counter()
             try:
                 resp = await page.goto(start_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -523,6 +551,11 @@ async def browser_hops(start_url, trace):
                 raise ScrapeError("START_URL_FAILED", f"Failed to load start URL: {err_text(e)}", 502)
             trace.add("browser:start", status=resp.status if resp else None, url=page.url,
                       ms=int((time.perf_counter() - t) * 1000))
+            if trace.inspect:
+                try:
+                    trace.add("inspect:start_html", html=snippet(await page.content(), 3500))
+                except Exception:
+                    pass
 
             try:
                 await page.wait_for_selector("#landing", state="attached", timeout=LANDING_WAIT_MS)
@@ -650,7 +683,7 @@ async def browser_variant(key, url, selector, trace):
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
+async def scrape(start_url: str, mode: str, trace: Trace, fast: bool = False) -> dict:
     if mode == "http" and not HAVE_CURL:
         raise ScrapeError("HTTP_UNAVAILABLE", "curl_cffi is not installed", 500)
 
@@ -684,7 +717,7 @@ async def scrape(start_url: str, mode: str, trace: Trace) -> dict:
                 )
 
         if hops is None:
-            hops, method = await browser_hops(start_url, trace), "browser"
+            hops, method = await browser_hops(start_url, trace, fast), "browser"
 
         redirect_url, final_url = hops
         file_id = file_id_from(final_url)
@@ -846,14 +879,16 @@ async def get_link():
     nocache = request.args.get("nocache") == "1"
 
     cache_key = f"{mode}|{start_url}"
+    nocache = nocache or request.args.get("debug") == "3"
     if not nocache:
         hit = cache_get(cache_key)
         if hit is not None:
             return jsonify({**hit, "cached": True})
 
-    trace = Trace(want_screenshot=(debug == "2"))
+    fast = request.args.get("fast", "1" if FAST_TIMERS else "0") == "1"
+    trace = Trace(want_screenshot=(debug == "2"), inspect=(debug == "3"))
     try:
-        result = await asyncio.wait_for(scrape(start_url, mode, trace), timeout=TOTAL_TIMEOUT)
+        result = await asyncio.wait_for(scrape(start_url, mode, trace, fast), timeout=TOTAL_TIMEOUT)
     except asyncio.TimeoutError:
         return error_response(
             ScrapeError("TOTAL_TIMEOUT", f"Gave up after {TOTAL_TIMEOUT:.0f}s", 504), trace, start_url
@@ -878,7 +913,7 @@ async def get_link():
         cache_put(cache_key, dict(result))
 
     # trace is attached on request (?debug=1|2) and automatically on any failure
-    if debug in ("1", "2") or missing:
+    if debug in ("1", "2", "3") or missing:
         result["debug"] = trace.export()
     return jsonify(result)
 
